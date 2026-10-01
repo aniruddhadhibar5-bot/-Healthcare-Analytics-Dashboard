@@ -1,19 +1,41 @@
 import base64
 import io
-from datetime import datetime
+import json
+import queue
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, html, dcc, Input, Output, State, callback, no_update
+from dash import Dash, html, dcc, Input, Output, State, callback, ctx, no_update
 from dash import dash_table
 import dash_bootstrap_components as dbc
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import roc_auc_score
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+    silhouette_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import calibration_curve
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 
@@ -52,6 +74,10 @@ patients = pd.DataFrame({
     "Biomarker": np.round(np.random.normal(2.4, 0.8, N).clip(0.2, 8), 2),
 })
 
+live_stream_queue = queue.Queue(maxsize=1000)
+stream_lock = threading.Lock()
+patient_streams = defaultdict(list)
+
 logit = (
     0.03 * (patients["Age"] - 50)
     + 0.06 * (patients["BMI"] - 25)
@@ -62,27 +88,83 @@ logit = (
     + 0.45 * patients["Biomarker"]
 )
 prob = 1 / (1 + np.exp(-logit / 4))
-patients["Cancer Risk"] = (prob > np.quantile(prob, 0.62)).astype(int)
+patients["Demo Positive Label"] = (prob > np.quantile(prob, 0.62)).astype(int)
 patients["Risk Score"] = np.round(prob, 3)
 
 feature_cols = ["Age", "BMI", "Blood Pressure", "Glucose", "Smoker", "Family History", "Biomarker"]
 X = patients[feature_cols]
-y = patients["Cancer Risk"]
+y = patients["Demo Positive Label"]
 
 # -----------------------------
-# ML model for cancer risk
+# Model benchmark for a synthetic classification target
 # -----------------------------
-model = Pipeline([
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=7, stratify=y)
+model_definitions = {
+    "Logistic Regression": LogisticRegression(max_iter=1000, class_weight="balanced", random_state=7),
+    "Random Forest": RandomForestClassifier(
+        n_estimators=240, min_samples_leaf=3, class_weight="balanced", random_state=7, n_jobs=1
+    ),
+    "Gradient Boosting": HistGradientBoostingClassifier(
+        max_iter=120, learning_rate=0.08, l2_regularization=1.0, random_state=7
+    ),
+}
+
+model_bank = {}
+model_probabilities = {}
+model_importance_bank = {}
+metric_rows = []
+for model_name, estimator in model_definitions.items():
+    fitted_model = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("clf", estimator),
+    ])
+    fitted_model.fit(Xtr, ytr)
+    probabilities = fitted_model.predict_proba(Xte)[:, 1]
+    predictions = (probabilities >= 0.5).astype(int)
+    model_bank[model_name] = fitted_model
+    model_probabilities[model_name] = probabilities
+    model_importance_bank[model_name] = permutation_importance(
+        fitted_model, Xte, yte, scoring="roc_auc", n_repeats=5, random_state=7
+    ).importances_mean
+    metric_rows.append({
+        "Model": model_name,
+        "ROC AUC": roc_auc_score(yte, probabilities),
+        "PR AUC": average_precision_score(yte, probabilities),
+        "Accuracy": accuracy_score(yte, predictions),
+        "Precision": precision_score(yte, predictions, zero_division=0),
+        "Recall": recall_score(yte, predictions, zero_division=0),
+        "F1": f1_score(yte, predictions, zero_division=0),
+        "Brier score": brier_score_loss(yte, probabilities),
+    })
+
+model_metrics = pd.DataFrame(metric_rows).sort_values("ROC AUC", ascending=False)
+model = model_bank["Random Forest"]
+auc = roc_auc_score(yte, model_probabilities["Random Forest"])
+test_probabilities = model_probabilities["Random Forest"]
+test_predictions = (test_probabilities >= 0.5).astype(int)
+roc_fpr, roc_tpr, _ = roc_curve(yte, test_probabilities)
+test_confusion = confusion_matrix(yte, test_predictions, labels=[0, 1])
+true_negative, false_positive, false_negative, true_positive = test_confusion.ravel()
+sensitivity = true_positive / (true_positive + false_negative)
+specificity = true_negative / (true_negative + false_positive)
+patients["Risk Score"] = np.round(model.predict_proba(X)[:, 1], 3)
+
+# Unsupervised profiles are descriptive clusters, not diagnostic groups.
+cluster_scaler = Pipeline([
     ("imputer", SimpleImputer(strategy="median")),
     ("scaler", StandardScaler()),
-    ("clf", RandomForestClassifier(n_estimators=120, random_state=7)),
 ])
+cluster_features = cluster_scaler.fit_transform(X)
+cluster_model = KMeans(n_clusters=4, n_init=20, random_state=7)
+patients["Demo Cluster"] = cluster_model.fit_predict(cluster_features)
+cluster_coordinates = PCA(n_components=2, random_state=7).fit_transform(cluster_features)
+patients["PC1"] = cluster_coordinates[:, 0]
+patients["PC2"] = cluster_coordinates[:, 1]
+cluster_silhouette = silhouette_score(cluster_features, patients["Demo Cluster"])
 
-Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=7, stratify=y)
-model.fit(Xtr, ytr)
-auc = roc_auc_score(yte, model.predict_proba(Xte)[:, 1])
-
-# Precompute feature importances for explanations
+# Global importance is descriptive; coefficient magnitude and tree importance
+# are shown as model-level summaries, not patient-specific causal explanations.
 feature_importance = pd.Series(
     model.named_steps["clf"].feature_importances_,
     index=feature_cols,
@@ -136,10 +218,23 @@ def black_fig(title: str):
         title=dict(text=title, x=0.02),
         margin=dict(l=40, r=20, t=55, b=40),
         legend=dict(bgcolor=BLACK),
+        transition={"duration": 500, "easing": "cubic-in-out"},
     )
     fig.update_xaxes(gridcolor="#222", zerolinecolor="#222", color=TEXT)
     fig.update_yaxes(gridcolor="#222", zerolinecolor="#222", color=TEXT)
     return fig
+
+def animated_graph(figure, **kwargs):
+    kwargs.setdefault("animate", True)
+    kwargs.setdefault(
+        "animation_options",
+        {
+            "frame": {"duration": 500, "redraw": False},
+            "transition": {"duration": 450, "easing": "cubic-in-out"},
+        },
+    )
+    kwargs.setdefault("config", {"displaylogo": False, "scrollZoom": True})
+    return dcc.Graph(figure=figure, **kwargs)
 
 def kpi_card(title, value, sub, color):
     return dbc.Card(
@@ -191,6 +286,139 @@ def age_group(age):
 
 patients["Age Group"] = patients["Age"].apply(age_group)
 
+def generate_live_reading(patient_id, tick):
+    patient = patients.loc[patients["Patient ID"] == patient_id].iloc[0]
+    patient_number = int(patient_id[1:])
+    rng = np.random.default_rng(7 + patient_number * 1009 + tick)
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "Patient ID": patient_id,
+        "Heart rate (bpm)": int(np.clip(rng.normal(70 + (patient["Age"] >= 65) * 5, 5), 48, 132)),
+        "Systolic BP (mmHg)": int(np.clip(rng.normal(patient["Blood Pressure"], 7), 82, 205)),
+        "Glucose (mg/dL)": int(np.clip(rng.normal(patient["Glucose"], 10), 55, 280)),
+        "SpO2 (%)": round(float(np.clip(rng.normal(97.5, 0.7), 88, 100)), 1),
+    }
+
+def live_demo_flags(reading):
+    checks = [
+        ("Heart rate", reading["Heart rate (bpm)"] < 50 or reading["Heart rate (bpm)"] > 120),
+        ("Systolic BP", reading["Systolic BP (mmHg)"] < 90 or reading["Systolic BP (mmHg)"] > 180),
+        ("Glucose", reading["Glucose (mg/dL)"] < 70 or reading["Glucose (mg/dL)"] > 200),
+        ("SpO2", reading["SpO2 (%)"] < 92),
+    ]
+    return [label for label, flagged in checks if flagged]
+
+def telemetry_stream_worker():
+    tick = 0
+    patient_ids = patients["Patient ID"].tolist()
+    while True:
+        for patient_id in patient_ids:
+            message = json.dumps(generate_live_reading(patient_id, tick))
+            try:
+                live_stream_queue.put_nowait(message)
+            except queue.Full:
+                try:
+                    live_stream_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                live_stream_queue.put_nowait(message)
+        tick += 1
+        time.sleep(3)
+
+def drain_live_stream():
+    while True:
+        try:
+            reading = json.loads(live_stream_queue.get_nowait())
+        except queue.Empty:
+            break
+        with stream_lock:
+            stream = patient_streams[reading["Patient ID"]]
+            stream.append(reading)
+            del stream[:-60]
+
+def get_live_readings(patient_id):
+    drain_live_stream()
+    with stream_lock:
+        return list(patient_streams.get(patient_id, []))
+
+threading.Thread(
+    target=telemetry_stream_worker,
+    name="synthetic-telemetry-publisher",
+    daemon=True,
+).start()
+
+def live_monitoring_layout(readings):
+    current = readings[-1] if readings else None
+    flags = live_demo_flags(current) if current else []
+    flag_children = (
+        [html.Span(f"{flag} demo threshold", style={"display": "inline-block", "padding": "6px 10px", "margin": "3px", "borderRadius": "16px", "backgroundColor": "#4a1520", "color": WARN}) for flag in flags]
+        if flags else [html.Span("No demo thresholds crossed in latest reading.", style={"color": ACCENT2})]
+    )
+    metrics = [
+        ("Heart rate", "live-heart-value", "bpm", ACCENT),
+        ("Systolic BP", "live-bp-value", "mmHg", ACCENT2),
+        ("Glucose", "live-glucose-value", "mg/dL", WARN),
+        ("Oxygen saturation", "live-spo2-value", "%", ACCENT),
+    ]
+    cards = []
+    for title, component_id, unit, color in metrics:
+        value = current.get({
+            "live-heart-value": "Heart rate (bpm)",
+            "live-bp-value": "Systolic BP (mmHg)",
+            "live-glucose-value": "Glucose (mg/dL)",
+            "live-spo2-value": "SpO2 (%)",
+        }[component_id], "--") if current else "--"
+        cards.append(dbc.Col(
+            dbc.Card(dbc.CardBody([
+                html.Div(title, style={"color": MUTED, "fontSize": "0.85rem"}),
+                html.Div([
+                    html.Span(str(value), id=component_id, style={"color": color, "fontSize": "1.9rem", "fontWeight": "700"}),
+                    html.Span(f" {unit}", style={"color": MUTED}),
+                ]),
+            ]), style={"backgroundColor": PANEL, "border": f"1px solid {BORDER}", "borderRadius": "14px"}),
+            md=3,
+        ))
+    chart_cards = [
+        ("Heart rate", "live-heart-chart"),
+        ("Systolic blood pressure", "live-bp-chart"),
+        ("Glucose", "live-glucose-chart"),
+        ("Oxygen saturation", "live-spo2-chart"),
+    ]
+    return html.Div([
+        dbc.Row([
+            dbc.Col(html.Div([
+                html.Span("● ", style={"color": ACCENT2}),
+                html.Strong("SIMULATOR RUNNING", style={"color": ACCENT2}),
+                html.Span("  •  Selected demo profile: P0001", id="live-selected-patient", style={"color": MUTED}),
+            ]), md=8),
+            dbc.Col(dbc.Button("Export readings CSV", id="live-export-button", color="info", outline=True, className="w-100"), md=4),
+        ], className="align-items-center g-2 mb-3"),
+        dbc.Row(cards, className="g-3 mb-3"),
+        html.Div(id="live-alerts", children=flag_children, style={"padding": "8px 12px", "backgroundColor": PANEL, "border": f"1px solid {BORDER}", "borderRadius": "12px", "marginBottom": "12px"}),
+        dbc.Row([
+            dbc.Col(dcc.Graph(
+                id=chart_id,
+                figure=black_fig(title),
+                animate=True,
+                config={"displaylogo": False, "scrollZoom": True},
+            ), md=6)
+            for title, chart_id in chart_cards
+        ], className="g-3"),
+        html.Div([
+            html.Span("Last simulated sample: ", style={"color": MUTED}),
+            html.Span(current["timestamp"] if current else "Waiting for first sample...", id="live-updated-at", style={"color": TEXT}),
+        ], style={"padding": "4px 0 10px"}),
+        dash_table.DataTable(
+            id="live-readings-table",
+            data=list(reversed(readings[-15:])),
+            columns=[{"name": col, "id": col} for col in (readings[-1].keys() if readings else ["timestamp", "Patient ID", "Heart rate (bpm)", "Systolic BP (mmHg)", "Glucose (mg/dL)", "SpO2 (%)"])],
+            page_size=10,
+            style_table={"overflowX": "auto"},
+            style_cell={"backgroundColor": PANEL, "color": TEXT, "border": f"1px solid {BORDER}", "padding": "7px", "textAlign": "left"},
+            style_header={"backgroundColor": "#111", "fontWeight": "bold"},
+        ),
+    ])
+
 # -----------------------------
 # Dash app initialization
 # -----------------------------
@@ -215,27 +443,37 @@ app.layout = html.Div(
     children=[
         dcc.Store(id="chat-store", data=shared_store),
         dcc.Store(id="upload-store", data=None),  # persistent upload result
-        dcc.Interval(id="live-interval", interval=2500, n_intervals=0),
+        dcc.Store(id="live-feed-store", data=[], storage_type="session"),
+        dcc.Interval(id="live-interval", interval=3000, n_intervals=0),
+        dcc.Download(id="live-export"),
         dbc.Container(
             fluid=True,
             children=[
                 html.Div(
                     style={"padding": "16px 8px"},
                     children=[
-                        html.H2(APP_TITLE, style={"margin": "0", "color": TEXT}),
-                        html.Div(f"Created by {CREATOR}", style={"color": ACCENT, "marginTop": "4px"}),
+                        html.Div("HEALTH ANALYTICS / SYNTHETIC SANDBOX", style={"color": ACCENT, "fontSize": "0.72rem", "letterSpacing": "0.16em", "fontWeight": "700"}),
+                        html.H2(APP_TITLE, style={"margin": "6px 0 2px", "color": TEXT, "fontWeight": "800"}),
                         html.Div(
-                            "Accessible AI-assisted clinical analytics, prevention support, collaboration, NLP reporting, and secure sharing.",
-                            style={"color": MUTED},
+                            f"Interactive analytics • Model benchmarking • Cohort discovery  |  Built by {CREATOR}",
+                            style={"color": MUTED, "fontSize": "0.94rem"},
+                        ),
+                        dbc.Alert(
+                            [
+                                html.Strong("SIMULATED DATA - NOT FOR CLINICAL USE. "),
+                                "No medical devices, EHR, or real patient data are connected. Demo thresholds are not clinical alarms.",
+                            ],
+                            color="warning",
+                            className="mt-3 mb-0",
                         ),
                     ],
                 ),
                 dbc.Row(
                     [
-                        dbc.Col(kpi_card("Patients", str(len(patients)), "Synthetic live demo data", ACCENT), md=3),
-                        dbc.Col(kpi_card("Cancer positives", str(int(patients["Cancer Risk"].sum())), f"Model AUC {auc:.2f}", ACCENT2), md=3),
-                        dbc.Col(kpi_card("High biomarker", str(int((patients["Biomarker"] > 3.0).sum())), "Flagged for review", WARN), md=3),
-                        dbc.Col(kpi_card("Status", "ONLINE", "Realtime updates enabled", ACCENT), md=3),
+                        dbc.Col(kpi_card("Patients", str(len(patients)), "Synthetic demo records", ACCENT), md=3),
+                        dbc.Col(kpi_card("Models benchmarked", str(len(model_bank)), f"Best demo AUC {model_metrics.iloc[0]['ROC AUC']:.2f}", ACCENT2), md=3),
+                        dbc.Col(kpi_card("Unsupervised profiles", "4", f"Silhouette {cluster_silhouette:.2f}", WARN), md=3),
+                        dbc.Col(kpi_card("Data mode", "SYNTHETIC", "Not for clinical use", ACCENT), md=3),
                     ],
                     className="g-3",
                     style={"marginBottom": "12px"},
@@ -245,7 +483,7 @@ app.layout = html.Div(
                         dbc.Col(
                             dcc.Dropdown(
                                 id="patient-dd",
-                                options=[{"label": p, "value": p} for p in patients["Patient ID"][:20]],
+                                options=[{"label": p, "value": p} for p in patients["Patient ID"]],
                                 value="P0001",
                                 clearable=False,
                             ),
@@ -268,7 +506,9 @@ app.layout = html.Div(
                     active_tab="tab-live",
                     children=[
                         dbc.Tab(label="Live Data", tab_id="tab-live"),
-                        dbc.Tab(label="Cancer Risk", tab_id="tab-cancer"),
+                        dbc.Tab(label="Model Studio", tab_id="tab-model"),
+                        dbc.Tab(label="Patient Phenotypes", tab_id="tab-phenotypes"),
+                        dbc.Tab(label="Risk Explorer", tab_id="tab-cancer"),
                         dbc.Tab(label="Population Insights", tab_id="tab-pop"),
                         dbc.Tab(label="Patient Explorer", tab_id="tab-explorer"),
                         dbc.Tab(label="Clinical Report", tab_id="tab-nlp"),
@@ -276,6 +516,94 @@ app.layout = html.Div(
                         dbc.Tab(label="Collaboration", tab_id="tab-collab"),
                         dbc.Tab(label="Secure Sharing", tab_id="tab-chain"),
                     ],
+                ),
+                html.Div(
+                    [
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    [
+                                        dbc.Label("Candidate model", html_for="model-select", style={"color": MUTED}),
+                                        dcc.Dropdown(
+                                            id="model-select",
+                                            options=[{"label": name, "value": name} for name in model_bank],
+                                            value="Random Forest",
+                                            clearable=False,
+                                        ),
+                                    ],
+                                    md=6,
+                                ),
+                                dbc.Col(
+                                    [
+                                        dbc.Label("Decision threshold", html_for="threshold-select", style={"color": MUTED}),
+                                        dcc.Slider(
+                                            id="threshold-select",
+                                            min=0.1,
+                                            max=0.9,
+                                            step=0.05,
+                                            value=0.5,
+                                            marks={0.1: "0.10", 0.5: "0.50", 0.9: "0.90"},
+                                            tooltip={"placement": "bottom", "always_visible": True},
+                                        ),
+                                    ],
+                                    md=6,
+                                ),
+                            ],
+                            className="g-3",
+                        )
+                    ],
+                    id="model-controls",
+                    style={"display": "none", "padding": "12px 4px 0"},
+                ),
+                html.Div(
+                    [
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    [
+                                        dbc.Label("Age cohort", html_for="age-filter", style={"color": MUTED}),
+                                        dcc.Dropdown(
+                                            id="age-filter",
+                                            options=[
+                                                {"label": "All age groups", "value": "All"},
+                                                *[
+                                                    {"label": group, "value": group}
+                                                    for group in ["<35", "35-49", "50-64", "65+"]
+                                                ],
+                                            ],
+                                            value="All",
+                                            clearable=False,
+                                        ),
+                                    ],
+                                    md=6,
+                                ),
+                                dbc.Col(
+                                    [
+                                        dbc.Label("Smoking status", html_for="smoker-filter", style={"color": MUTED}),
+                                        dcc.Dropdown(
+                                            id="smoker-filter",
+                                            options=[
+                                                {"label": "All", "value": "all"},
+                                                {"label": "Smoker", "value": "1"},
+                                                {"label": "Non-smoker", "value": "0"},
+                                            ],
+                                            value="all",
+                                            clearable=False,
+                                        ),
+                                    ],
+                                    md=6,
+                                ),
+                            ],
+                            className="g-3",
+                        )
+                    ],
+                    id="population-filters",
+                    style={"display": "none", "padding": "12px 4px 0"},
+                ),
+                html.Div(
+                    live_monitoring_layout([]),
+                    id="live-monitor-container",
+                    style={"display": "none", "padding": "14px 4px"},
                 ),
                 html.Div(id="tab-content", style={"padding": "14px 4px"}),
                 # This div will hold upload result independently of tabs
@@ -310,49 +638,277 @@ def add_message(n, msg, data):
     return data
 
 @callback(
+    Output("population-filters", "style"),
+    Input("tabs", "active_tab"),
+)
+def show_population_filters(tab):
+    return {"display": "block", "padding": "12px 4px 0"} if tab == "tab-pop" else {"display": "none"}
+
+@callback(
+    Output("model-controls", "style"),
+    Input("tabs", "active_tab"),
+)
+def show_model_controls(tab):
+    return {"display": "block", "padding": "12px 4px 0"} if tab == "tab-model" else {"display": "none"}
+
+@callback(
+    Output("live-monitor-container", "style"),
+    Input("tabs", "active_tab"),
+)
+def show_live_monitor(tab):
+    return {"display": "block", "padding": "14px 4px"} if tab == "tab-live" else {"display": "none"}
+
+@callback(
     Output("tab-content", "children"),
     Input("tabs", "active_tab"),
-    Input("live-interval", "n_intervals"),
     Input("patient-dd", "value"),
     Input("chat-store", "data"),
+    Input("age-filter", "value"),
+    Input("smoker-filter", "value"),
+    Input("model-select", "value"),
+    Input("threshold-select", "value"),
 )
-def render_tab(tab, n, patient_id, chat_data):
+def render_tab(tab, patient_id, chat_data, age_filter, smoker_filter, selected_model, threshold):
     row, risk = patient_risk_row(patient_id)
 
-    if tab == "tab-live":
-        fig = black_fig("Live Vital Trend")
-        xs = list(range(20))
-        ys = 72 + np.sin(np.linspace(0, 4 * np.pi, 20)) * 6 + np.random.normal(0, 1.2, 20)
-        fig.add_trace(
-            go.Scatter(
-                x=xs,
-                y=ys,
-                mode="lines+markers",
-                line=dict(color=ACCENT, width=3),
-                marker=dict(size=7),
-                name="Heart rate",
-            )
-        )
+    if tab == "tab-model":
+        selected_probabilities = model_probabilities[selected_model]
+        selected_predictions = (selected_probabilities >= threshold).astype(int)
+        tn, fp, fn, tp = confusion_matrix(yte, selected_predictions, labels=[0, 1]).ravel()
+        sensitivity_at_threshold = tp / (tp + fn) if tp + fn else 0
+        specificity_at_threshold = tn / (tn + fp) if tn + fp else 0
+        selected_metrics = model_metrics.set_index("Model").loc[selected_model]
 
-        table = dash_table.DataTable(
-            data=patients.head(8).to_dict("records"),
-            columns=[{"name": c, "id": c} for c in patients.columns],
-            style_table={"overflowX": "auto"},
+        fig_roc = black_fig("Out-of-sample ROC comparison")
+        fig_pr = black_fig("Precision-recall comparison")
+        for name, probabilities in model_probabilities.items():
+            fpr, tpr, _ = roc_curve(yte, probabilities)
+            precision, recall, _ = precision_recall_curve(yte, probabilities)
+            auc_score = model_metrics.set_index("Model").loc[name, "ROC AUC"]
+            line_color = ACCENT if name == selected_model else "#667085"
+            width = 3 if name == selected_model else 1.5
+            fig_roc.add_trace(go.Scatter(
+                x=fpr, y=tpr, mode="lines",
+                line={"color": line_color, "width": width},
+                name=f"{name} (AUC {auc_score:.2f})",
+            ))
+            fig_pr.add_trace(go.Scatter(
+                x=recall, y=precision, mode="lines",
+                line={"color": line_color, "width": width},
+                name=name,
+            ))
+        fig_roc.add_trace(go.Scatter(
+            x=[0, 1], y=[0, 1], mode="lines",
+            line={"color": MUTED, "dash": "dash"}, name="Random baseline",
+        ))
+        fig_roc.update_layout(xaxis_title="False positive rate", yaxis_title="True positive rate")
+        fig_pr.update_layout(xaxis_title="Recall", yaxis_title="Precision")
+
+        fig_matrix = black_fig(f"{selected_model} confusion matrix at {threshold:.0%} threshold")
+        fig_matrix.add_trace(go.Heatmap(
+            z=[[tn, fp], [fn, tp]],
+            x=["Predicted negative", "Predicted positive"],
+            y=["Actual negative", "Actual positive"],
+            colorscale="Viridis",
+            text=[[tn, fp], [fn, tp]],
+            texttemplate="%{text}",
+            showscale=False,
+        ))
+
+        calibrated_true, calibrated_predicted = calibration_curve(
+            yte, selected_probabilities, n_bins=5, strategy="quantile"
+        )
+        fig_calibration = black_fig("Probability calibration (holdout)")
+        fig_calibration.add_trace(go.Scatter(
+            x=calibrated_predicted,
+            y=calibrated_true,
+            mode="lines+markers",
+            line={"color": ACCENT2, "width": 3},
+            name=selected_model,
+        ))
+        fig_calibration.add_trace(go.Scatter(
+            x=[0, 1], y=[0, 1], mode="lines",
+            line={"color": MUTED, "dash": "dash"}, name="Perfect calibration",
+        ))
+        fig_calibration.update_layout(xaxis_title="Mean predicted score", yaxis_title="Observed demo positive rate")
+
+        model_importance = pd.Series(
+            model_importance_bank[selected_model], index=feature_cols
+        ).sort_values()
+        fig_importance = black_fig(f"{selected_model} global feature signal")
+        fig_importance.add_trace(go.Bar(
+            x=model_importance.values,
+            y=model_importance.index,
+            orientation="h",
+            marker_color=ACCENT,
+            name="Relative model signal",
+        ))
+        fig_importance.update_layout(xaxis_title="Relative signal (not causal impact)")
+
+        leaderboard = dash_table.DataTable(
+            data=model_metrics.round(3).to_dict("records"),
+            columns=[{"name": column, "id": column} for column in model_metrics.columns],
+            sort_action="native",
+            style_table={"overflowX": "auto", "marginTop": "8px"},
             style_cell={
-                "backgroundColor": PANEL,
-                "color": TEXT,
-                "border": f"1px solid {BORDER}",
-                "fontFamily": "Arial",
-                "textAlign": "left",
-                "padding": "8px",
+                "backgroundColor": PANEL, "color": TEXT, "border": f"1px solid {BORDER}",
+                "fontFamily": "Arial", "textAlign": "left", "padding": "9px",
             },
             style_header={
-                "backgroundColor": "#111",
-                "fontWeight": "bold",
-                "border": f"1px solid {BORDER}",
+                "backgroundColor": "#111", "fontWeight": "bold", "border": f"1px solid {BORDER}",
             },
+            style_data_conditional=[{
+                "if": {"filter_query": f'{{Model}} = "{selected_model}"'},
+                "backgroundColor": "#10272b",
+                "color": ACCENT,
+            }],
         )
-        return html.Div([dcc.Graph(figure=fig), table])
+        return html.Div([
+            dbc.Row([
+                dbc.Col(kpi_card("Selected model", selected_model, "Trained on synthetic labels", ACCENT), md=3),
+                dbc.Col(kpi_card("Holdout ROC AUC", f"{selected_metrics['ROC AUC']:.3f}", "Same stratified holdout", ACCENT2), md=3),
+                dbc.Col(kpi_card("Sensitivity", f"{sensitivity_at_threshold:.1%}", f"At {threshold:.0%} threshold", WARN), md=3),
+                dbc.Col(kpi_card("Specificity", f"{specificity_at_threshold:.1%}", f"At {threshold:.0%} threshold", ACCENT), md=3),
+            ], className="g-3 mb-2"),
+            html.H5("Model leaderboard", style={"color": TEXT, "marginTop": "20px"}),
+            html.Div("All candidates share the same stratified holdout. Metrics describe this simulated task only.", style={"color": MUTED}),
+            leaderboard,
+            dbc.Row([
+                dbc.Col(animated_graph(fig_roc), md=6),
+                dbc.Col(animated_graph(fig_pr), md=6),
+            ], className="g-3 mt-2"),
+            dbc.Row([
+                dbc.Col(animated_graph(fig_matrix), md=6),
+                dbc.Col(animated_graph(fig_calibration), md=6),
+            ], className="g-3"),
+            dbc.Row([
+                dbc.Col(animated_graph(fig_importance), md=12),
+            ], className="g-3"),
+            html.Div(
+                "Threshold changes are an interactive operating-point demonstration, not clinical guidance. Calibration and feature signals are not validated on real-world data.",
+                style={"color": MUTED, "padding": "8px 0 20px"},
+            ),
+        ])
+
+    if tab == "tab-phenotypes":
+        cluster_summary = patients.groupby("Demo Cluster", as_index=False).agg(
+            patients=("Patient ID", "count"),
+            mean_age=("Age", "mean"),
+            mean_bmi=("BMI", "mean"),
+            mean_glucose=("Glucose", "mean"),
+            mean_biomarker=("Biomarker", "mean"),
+            mean_demo_score=("Risk Score", "mean"),
+            demo_positive_rate=("Demo Positive Label", "mean"),
+        )
+        fig_pca = black_fig("Unsupervised patient profiles (PCA projection)")
+        colors = [ACCENT, ACCENT2, WARN, "#A78BFA"]
+        for cluster_id, color in zip(sorted(patients["Demo Cluster"].unique()), colors):
+            group = patients[patients["Demo Cluster"] == cluster_id]
+            fig_pca.add_trace(go.Scatter(
+                x=group["PC1"],
+                y=group["PC2"],
+                mode="markers",
+                marker={"size": 10, "color": color, "opacity": 0.85, "line": {"color": TEXT, "width": 0.5}},
+                text=group["Patient ID"],
+                customdata=np.column_stack([group["Age"], group["BMI"], group["Glucose"], group["Biomarker"]]),
+                hovertemplate="%{text}<br>Age %{customdata[0]}<br>BMI %{customdata[1]}<br>Glucose %{customdata[2]}<br>Biomarker %{customdata[3]}<extra></extra>",
+                name=f"Profile {cluster_id + 1} (n={len(group)})",
+            ))
+        fig_pca.update_layout(xaxis_title="Principal component 1", yaxis_title="Principal component 2")
+
+        fig_3d = go.Figure()
+        for cluster_id, color in zip(sorted(patients["Demo Cluster"].unique()), colors):
+            group = patients[patients["Demo Cluster"] == cluster_id]
+            fig_3d.add_trace(go.Scatter3d(
+                x=group["Age"],
+                y=group["BMI"],
+                z=group["Glucose"],
+                mode="markers",
+                marker={
+                    "size": 5 + group["Risk Score"] * 5,
+                    "color": color,
+                    "opacity": 0.82,
+                    "line": {"color": "#101820", "width": 0.5},
+                },
+                text=group["Patient ID"],
+                customdata=np.column_stack([
+                    group["Biomarker"], group["Risk Score"], group["Demo Cluster"] + 1,
+                ]),
+                hovertemplate=(
+                    "%{text}<br>Age %{x}<br>BMI %{y}<br>Glucose %{z}"
+                    "<br>Biomarker %{customdata[0]:.2f}"
+                    "<br>Demo score %{customdata[1]:.1%}"
+                    "<br>Unsupervised profile %{customdata[2]}<extra></extra>"
+                ),
+                name=f"Profile {cluster_id + 1}",
+            ))
+        fig_3d.update_layout(
+            template="plotly_dark",
+            paper_bgcolor=BLACK,
+            plot_bgcolor=BLACK,
+            font={"color": TEXT},
+            scene={
+                "bgcolor": BLACK,
+                "xaxis": {"title": "Age (years)", "backgroundcolor": BLACK, "gridcolor": BORDER, "color": MUTED},
+                "yaxis": {"title": "BMI", "backgroundcolor": BLACK, "gridcolor": BORDER, "color": MUTED},
+                "zaxis": {"title": "Glucose (mg/dL)", "backgroundcolor": BLACK, "gridcolor": BORDER, "color": MUTED},
+                "camera": {"eye": {"x": 1.45, "y": 1.45, "z": 1.15}},
+            },
+            title={"text": "Interactive 3D feature space", "x": 0.02},
+            margin={"l": 0, "r": 0, "t": 50, "b": 0},
+            legend={"bgcolor": BLACK},
+        )
+
+        profile_values = cluster_summary.set_index("Demo Cluster")[
+            ["mean_age", "mean_bmi", "mean_glucose", "mean_biomarker"]
+        ]
+        profile_values.columns = ["Age", "BMI", "Glucose", "Biomarker"]
+        cluster_features_for_profile = patients[["Age", "BMI", "Glucose", "Biomarker"]]
+        profile_zscores = (
+            profile_values - cluster_features_for_profile.mean()
+        ) / cluster_features_for_profile.std()
+        fig_profile = black_fig("Cluster feature profiles (population z-score)")
+        fig_profile.add_trace(go.Heatmap(
+            z=profile_zscores.values,
+            x=["Age", "BMI", "Glucose", "Biomarker"],
+            y=[f"Profile {cluster_id + 1}" for cluster_id in profile_zscores.index],
+            colorscale="RdBu",
+            zmid=0,
+            text=np.round(profile_zscores.values, 1),
+            texttemplate="%{text}",
+            colorbar={"title": "Standard deviations"},
+        ))
+        fig_profile.update_layout(margin={"l": 60, "r": 20, "t": 55, "b": 40})
+
+        return html.Div([
+            dbc.Row([
+                dbc.Col(kpi_card("Profiles found", "4", "K-means on standardized features", ACCENT), md=4),
+                dbc.Col(kpi_card("Silhouette score", f"{cluster_silhouette:.3f}", "Internal separation metric", ACCENT2), md=4),
+                dbc.Col(kpi_card("Patients grouped", f"{len(patients):,}", "Synthetic dataset", WARN), md=4),
+            ], className="g-3 mb-2"),
+            dbc.Row([
+                dbc.Col(animated_graph(fig_3d), md=7),
+                dbc.Col(animated_graph(fig_pca), md=5),
+            ], className="g-3"),
+            dbc.Row([
+                dbc.Col(animated_graph(fig_profile), md=12),
+            ], className="g-3"),
+            html.H5("Profile summary", style={"color": TEXT, "marginTop": "16px"}),
+            dash_table.DataTable(
+                data=cluster_summary.round(2).to_dict("records"),
+                columns=[{"name": column.replace("_", " ").title(), "id": column} for column in cluster_summary.columns],
+                style_table={"overflowX": "auto"},
+                style_cell={"backgroundColor": PANEL, "color": TEXT, "border": f"1px solid {BORDER}", "padding": "8px", "textAlign": "left"},
+                style_header={"backgroundColor": "#111", "fontWeight": "bold"},
+            ),
+            html.Div(
+                "Clusters are mathematical groupings of generated feature values, not patient diagnoses or meaningful clinical phenotypes.",
+                style={"color": MUTED, "padding": "12px 0"},
+            ),
+        ])
+
+    if tab == "tab-live":
+        return html.Div()
 
     if tab == "tab-cancer":
         fig = go.Figure(
@@ -395,37 +951,116 @@ def render_tab(tab, n, patient_id, chat_data):
             ),
             margin=dict(l=0, r=0, t=40, b=0),
         )
+        fig_roc = black_fig("Holdout ROC curve")
+        fig_roc.add_trace(
+            go.Scatter(
+                x=roc_fpr,
+                y=roc_tpr,
+                mode="lines",
+                line=dict(color=ACCENT, width=3),
+                name=f"AUC {auc:.2f}",
+            )
+        )
+        fig_roc.add_trace(
+            go.Scatter(
+                x=[0, 1],
+                y=[0, 1],
+                mode="lines",
+                line=dict(color=MUTED, dash="dash"),
+                name="Random baseline",
+            )
+        )
+        fig_roc.update_layout(xaxis_title="False positive rate", yaxis_title="True positive rate")
+
+        fig_matrix = black_fig("Holdout confusion matrix (threshold 0.50)")
+        fig_matrix.add_trace(
+            go.Heatmap(
+                z=test_confusion,
+                x=["Predicted low", "Predicted high"],
+                y=["Actual low", "Actual high"],
+                colorscale="Viridis",
+                text=test_confusion,
+                texttemplate="%{text}",
+                showscale=False,
+            )
+        )
         return html.Div([
-            dcc.Graph(figure=fig),
-            html.Div(f"Predicted cancer risk for {patient_id}: {risk:.2%}", style={"color": ACCENT, "fontSize": "1.2rem"}),
-            html.Div("This result supports prevention workflows and should be interpreted by a clinician.", style={"color": MUTED}),
+            animated_graph(fig),
+            dbc.Row([
+                dbc.Col(animated_graph(fig_roc), md=6),
+                dbc.Col(animated_graph(fig_matrix), md=6),
+            ], className="g-3"),
+            dbc.Row([
+                dbc.Col(kpi_card("Holdout AUC", f"{auc:.2f}", "Threshold-independent ranking", ACCENT), md=4),
+                dbc.Col(kpi_card("Sensitivity", f"{sensitivity:.1%}", "At a 0.50 demo threshold", ACCENT2), md=4),
+                dbc.Col(kpi_card("Specificity", f"{specificity:.1%}", "At a 0.50 demo threshold", WARN), md=4),
+            ], className="g-3 mb-3"),
+            html.Div(f"Model score for {patient_id}: {risk:.1%}", style={"color": ACCENT, "fontSize": "1.2rem"}),
+            html.Div(
+                "Educational synthetic demo: the target is generated from simulated features, so these scores and holdout metrics are not clinical evidence or validated cancer predictions.",
+                style={"color": MUTED},
+            ),
         ])
 
     if tab == "tab-pop":
-        agg = patients.groupby("Age Group", as_index=False).agg(
-            {"Risk Score": "mean", "Cancer Risk": "sum", "Patient ID": "count"}
-        ).rename(columns={"Patient ID": "Count"})
-        fig_age = black_fig("Average Risk Score by Age Group")
+        cohort = patients.copy()
+        if age_filter and age_filter != "All":
+            cohort = cohort[cohort["Age Group"] == age_filter]
+        if smoker_filter in {"0", "1"}:
+            cohort = cohort[cohort["Smoker"] == int(smoker_filter)]
+        if cohort.empty:
+            return html.Div("No patients match the selected cohort.", style={"color": MUTED})
+
+        age_order = ["<35", "35-49", "50-64", "65+"]
+        agg = cohort.groupby("Age Group", as_index=False, observed=False).agg(
+            mean_score=("Risk Score", "mean"),
+            positive_rate=("Demo Positive Label", "mean"),
+            patients=("Patient ID", "count"),
+        )
+        agg["Age Group"] = pd.Categorical(agg["Age Group"], categories=age_order, ordered=True)
+        agg = agg.sort_values("Age Group")
+        agg["positive_rate"] *= 100
+
+        fig_age = black_fig("Mean model score by age group")
         fig_age.add_trace(
             go.Bar(
                 x=agg["Age Group"],
-                y=agg["Risk Score"],
+                y=agg["mean_score"],
                 marker_color=ACCENT,
-                name="Avg Risk Score",
+                name="Mean model score",
+                customdata=agg[["patients", "positive_rate"]],
+                hovertemplate="Age %{x}<br>Mean score %{y:.1%}<br>Patients %{customdata[0]}<br>Demo positive rate %{customdata[1]:.1f}%<extra></extra>",
             )
         )
-        smoke_agg = patients.groupby("Smoker", as_index=False)["Risk Score"].mean()
+        fig_age.update_layout(yaxis_title="Mean model score")
+
+        smoke_agg = cohort.groupby("Smoker", as_index=False).agg(
+            mean_score=("Risk Score", "mean"),
+            positive_rate=("Demo Positive Label", "mean"),
+            patients=("Patient ID", "count"),
+        )
         smoke_agg["Label"] = smoke_agg["Smoker"].map({0: "Non-smoker", 1: "Smoker"})
-        fig_smoke = black_fig("Risk by Smoking Status")
+        smoke_agg["positive_rate"] *= 100
+        fig_smoke = black_fig("Model score by smoking status")
         fig_smoke.add_trace(
             go.Bar(
                 x=smoke_agg["Label"],
-                y=smoke_agg["Risk Score"],
-                marker_color=[ACCENT2, WARN],
-                name="Avg Risk",
+                y=smoke_agg["mean_score"],
+                marker_color=smoke_agg["Smoker"].map({0: ACCENT2, 1: WARN}),
+                name="Mean model score",
+                customdata=smoke_agg[["patients", "positive_rate"]],
+                hovertemplate="%{x}<br>Mean score %{y:.1%}<br>Patients %{customdata[0]}<br>Demo positive rate %{customdata[1]:.1f}%<extra></extra>",
             )
         )
-        heat = patients.groupby(["Age Group", "Smoker"])["Risk Score"].mean().unstack(fill_value=0)
+        fig_smoke.update_layout(yaxis_title="Mean model score")
+
+        heat = cohort.pivot_table(
+            index="Age Group",
+            columns="Smoker",
+            values="Risk Score",
+            aggfunc="mean",
+            observed=False,
+        ).reindex(index=age_order, columns=[0, 1])
         heat.index = heat.index.astype(str)
         heat.columns = heat.columns.map({0: "Non-smoker", 1: "Smoker"})
         fig_heat = black_fig("Risk Heatmap: Age Group × Smoking")
@@ -436,17 +1071,55 @@ def render_tab(tab, n, patient_id, chat_data):
                 y=heat.index.tolist(),
                 colorscale="Viridis",
                 showscale=True,
+                colorbar={"title": "Mean score"},
             )
+        )
+        fig_scatter = black_fig("BMI and glucose by patient")
+        fig_scatter.add_trace(
+            go.Scatter(
+                x=cohort["BMI"],
+                y=cohort["Glucose"],
+                mode="markers",
+                marker={
+                    "size": 8,
+                    "color": cohort["Risk Score"],
+                    "colorscale": "Viridis",
+                    "showscale": True,
+                    "colorbar": {"title": "Model score"},
+                    "line": {"width": 0.5, "color": TEXT},
+                },
+                text=cohort["Patient ID"],
+                customdata=np.column_stack([cohort["Age"], cohort["Risk Score"]]),
+                hovertemplate="%{text}<br>BMI %{x}<br>Glucose %{y}<br>Age %{customdata[0]}<br>Model score %{customdata[1]:.1%}<extra></extra>",
+                name="Patients",
+            )
+        )
+        fig_scatter.update_layout(xaxis_title="BMI", yaxis_title="Glucose")
+
+        top_group = agg.loc[agg["mean_score"].idxmax()]
+        insight = (
+            f"{len(cohort)} synthetic patients in this cohort. "
+            f"The highest mean model score is in age group {top_group['Age Group']} "
+            f"({top_group['mean_score']:.1%}; n={int(top_group['patients'])}). "
+            "These are descriptive patterns in generated demo data, not population-health estimates."
         )
         return html.Div([
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_age), md=6),
-                dbc.Col(dcc.Graph(figure=fig_smoke), md=6),
+                dbc.Col(kpi_card("Patients in cohort", f"{len(cohort):,}", "After selected filters", ACCENT), md=4),
+                dbc.Col(kpi_card("Mean model score", f"{cohort['Risk Score'].mean():.1%}", "Not a clinical probability", ACCENT2), md=4),
+                dbc.Col(kpi_card("Demo positive labels", f"{cohort['Demo Positive Label'].mean():.1%}", "Simulated target labels", WARN), md=4),
+            ], className="g-3 mb-2"),
+            dbc.Row([
+                dbc.Col(animated_graph(fig_age), md=6),
+                dbc.Col(animated_graph(fig_smoke), md=6),
             ], className="g-3"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_heat), md=12),
+                dbc.Col(animated_graph(fig_heat), md=12),
             ], className="g-3 mt-2"),
-            html.Div("Population-level insights help prioritize prevention programs.", style={"color": MUTED, "marginTop": "8px"}),
+            dbc.Row([
+                dbc.Col(animated_graph(fig_scatter), md=12),
+            ], className="g-3 mt-2"),
+            html.Div(insight, style={"color": MUTED, "marginTop": "8px"}),
         ])
 
     if tab == "tab-explorer":
@@ -480,35 +1153,37 @@ def render_tab(tab, n, patient_id, chat_data):
 
         top_factors = feature_importance.head(3).index.tolist()
         explanation = (
-            f"For {patient_id}, the model's prediction is driven mainly by: "
-            + ", ".join(top_factors)
-            + ". Higher values in these factors generally increase risk."
+            f"The demo model's highest global feature importances are: {', '.join(top_factors)}. "
+            f"{patient_id}'s model score is {risk:.1%}. Global feature importance does not explain "
+            "the cause of an individual patient's score."
         )
         return html.Div([
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_imp), md=6),
-                dbc.Col(dcc.Graph(figure=fig_radar), md=6),
+                dbc.Col(animated_graph(fig_imp), md=6),
+                dbc.Col(animated_graph(fig_radar), md=6),
             ], className="g-3"),
             html.Div(explanation, style={"color": TEXT, "marginTop": "12px", "fontSize": "1.05rem"}),
             html.Div("Use this to discuss personalized prevention strategies with a clinician.", style={"color": MUTED}),
         ])
 
     if tab == "tab-nlp":
-        idx = n % len(notes_df)
-        note = notes_df.iloc[idx]["note"]
-        summary = notes_df.iloc[idx]["summary"]
-        generated = simple_clinical_interpretation(note)
         return html.Div([
-            dbc.Textarea(
-                value=note,
-                style={"backgroundColor": PANEL, "color": TEXT, "height": "140px"},
-                readOnly=True,
-            ),
-            html.Hr(style={"borderColor": BORDER}),
-            html.Div("AI-assisted summary:", style={"color": ACCENT2, "fontWeight": "700"}),
-            html.Div(summary, style={"color": TEXT, "marginBottom": "8px"}),
-            html.Div("Plain-language clinical note interpretation:", style={"color": ACCENT, "fontWeight": "700"}),
-            html.Div(generated, style={"color": TEXT}),
+            html.Div(
+                [
+                    html.H5(f"Example note {index + 1}", style={"color": ACCENT}),
+                    dbc.Textarea(
+                        value=note,
+                        style={"backgroundColor": PANEL, "color": TEXT, "height": "90px"},
+                        readOnly=True,
+                    ),
+                    html.Div("Demo summary:", style={"color": ACCENT2, "fontWeight": "700", "marginTop": "8px"}),
+                    html.Div(summary, style={"color": TEXT, "marginBottom": "8px"}),
+                    html.Div("Rule-based interpretation:", style={"color": ACCENT, "fontWeight": "700"}),
+                    html.Div(simple_clinical_interpretation(note), style={"color": TEXT}),
+                ],
+                style={"backgroundColor": PANEL, "padding": "14px", "border": f"1px solid {BORDER}", "borderRadius": "12px", "marginBottom": "12px"},
+            )
+            for index, (note, summary) in enumerate(zip(notes_df["note"], notes_df["summary"]))
         ])
 
     if tab == "tab-upload":
@@ -542,7 +1217,7 @@ def render_tab(tab, n, patient_id, chat_data):
                 style={"backgroundColor": PANEL, "padding": "16px", "border": f"1px solid {BORDER}", "borderRadius": "12px"},
             ),
             html.Div(
-                "You can upload any CSV file. If it contains healthcare-like columns (Age, BMI, Blood Pressure, Glucose, Smoker, Family History, Biomarker), the dashboard will also show risk predictions.",
+                "You can upload a CSV for preview. Matching synthetic-demo feature columns enable illustrative model scores, not clinical predictions.",
                 style={"color": MUTED, "marginTop": "8px"},
             ),
         ])
@@ -569,7 +1244,10 @@ def render_tab(tab, n, patient_id, chat_data):
                     "minHeight": "120px",
                 },
             ),
-            html.Div("Shared room updates appear for all connected users.", style={"marginTop": "8px", "color": MUTED}),
+            html.Div(
+                "Demo messages stay in this browser session; users are not connected and messages are not shared across browsers.",
+                style={"marginTop": "8px", "color": MUTED},
+            ),
         ])
 
     fig = black_fig("Secure Sharing Ledger")
@@ -578,10 +1256,103 @@ def render_tab(tab, n, patient_id, chat_data):
     y = list(range(1, len(x) + 1)) if ledger else [1]
     fig.add_trace(go.Bar(x=x, y=y, marker_color=ACCENT))
     return html.Div([
-        dcc.Graph(figure=fig),
+        animated_graph(fig),
         html.Div("Blockchain-style audit trail demo for secure healthcare sharing.", style={"color": MUTED}),
         html.Div("Only hashes and events should be shared on-chain in a real deployment.", style={"color": ACCENT2}),
     ])
+
+@callback(
+    Output("live-feed-store", "data"),
+    Input("live-interval", "n_intervals"),
+    Input("patient-dd", "value"),
+    State("live-feed-store", "data"),
+)
+def update_live_feed(tick, patient_id, readings):
+    if (
+        ctx.triggered_id == "patient-dd"
+        or (readings and readings[-1].get("Patient ID") != patient_id)
+    ):
+        readings = []
+    latest = get_live_readings(patient_id)
+    return latest[-60:] if latest else (readings or [])
+
+def make_live_chart(readings, title, value_key, color, unit):
+    fig = black_fig(title)
+    fig.add_trace(go.Scatter(
+        x=[reading["timestamp"] for reading in readings],
+        y=[reading[value_key] for reading in readings],
+        mode="lines+markers",
+        line={"color": color, "width": 2.5, "shape": "spline"},
+        marker={"size": 6},
+        name=title,
+        hovertemplate="%{x}<br>%{y} " + unit + "<extra></extra>",
+    ))
+    fig.update_layout(
+        xaxis_title="UTC timestamp",
+        yaxis_title=unit,
+        showlegend=False,
+        margin={"l": 50, "r": 20, "t": 45, "b": 50},
+        transition={"duration": 450, "easing": "cubic-in-out"},
+    )
+    return fig
+
+@callback(
+    Output("live-heart-chart", "figure"),
+    Output("live-bp-chart", "figure"),
+    Output("live-glucose-chart", "figure"),
+    Output("live-spo2-chart", "figure"),
+    Output("live-heart-value", "children"),
+    Output("live-bp-value", "children"),
+    Output("live-glucose-value", "children"),
+    Output("live-spo2-value", "children"),
+    Output("live-alerts", "children"),
+    Output("live-readings-table", "data"),
+    Output("live-updated-at", "children"),
+    Output("live-selected-patient", "children"),
+    Input("live-feed-store", "data"),
+)
+def render_live_feed(readings):
+    readings = readings or []
+    if not readings:
+        return (no_update,) * 12
+    current = readings[-1]
+    flags = live_demo_flags(current)
+    flag_children = (
+        [html.Span(
+            f"{flag} demo threshold",
+            style={"display": "inline-block", "padding": "6px 10px", "margin": "3px", "borderRadius": "16px", "backgroundColor": "#4a1520", "color": WARN},
+        ) for flag in flags]
+        if flags else [html.Span("No demo thresholds crossed in latest reading.", style={"color": ACCENT2})]
+    )
+    return (
+        make_live_chart(readings, "Heart rate", "Heart rate (bpm)", ACCENT, "bpm"),
+        make_live_chart(readings, "Systolic blood pressure", "Systolic BP (mmHg)", ACCENT2, "mmHg"),
+        make_live_chart(readings, "Glucose", "Glucose (mg/dL)", WARN, "mg/dL"),
+        make_live_chart(readings, "Oxygen saturation", "SpO2 (%)", "#A78BFA", "%"),
+        current["Heart rate (bpm)"],
+        current["Systolic BP (mmHg)"],
+        current["Glucose (mg/dL)"],
+        current["SpO2 (%)"],
+        flag_children,
+        list(reversed(readings[-15:])),
+        current["timestamp"],
+        f"  •  Selected demo profile: {current['Patient ID']}",
+    )
+
+@callback(
+    Output("live-export", "data"),
+    Input("live-export-button", "n_clicks"),
+    State("live-feed-store", "data"),
+    prevent_initial_call=True,
+)
+def export_live_readings(n_clicks, readings):
+    if not readings:
+        return no_update
+    return dcc.send_data_frame(
+        pd.DataFrame(readings).to_csv,
+        "simulated-vitals.csv",
+        index=False,
+    )
 
 # -----------------------------
 # Upload callback (robust, no index errors)
@@ -696,8 +1467,8 @@ def handle_upload(contents, filename):
             if len(df_clean) > 0:
                 Xnew = df_clean[required]
                 risk_new = model.predict_proba(Xnew)[:, 1]
-                df_clean["Predicted Risk"] = np.round(risk_new, 3)
-                high = int((df_clean["Predicted Risk"] > 0.6).sum())
+                df_clean["Demo Model Score"] = np.round(risk_new, 3)
+                high = int((df_clean["Demo Model Score"] > 0.6).sum())
                 total = len(df_clean)
 
                 result["risk_head"] = df_clean.head(10).to_dict("records")
@@ -746,18 +1517,18 @@ def render_upload_result(stored):
 
         parts.append(
             html.Div(
-                "This file looks like healthcare data. Showing risk predictions for matching rows:",
+                "Feature columns match the synthetic demo model. Showing illustrative scores for matching rows:",
                 style={"color": ACCENT2, "fontWeight": "700", "marginTop": "12px"},
             )
         )
         parts.append(
             html.Div(
-                f"Valid rows used for prediction: {total}. High-risk (>60%): {high}",
+                f"Valid rows scored: {total}. Demo scores above 60%: {high}",
                 style={"color": ACCENT, "fontSize": "1.05rem"},
             )
         )
         parts.append(
-            html.Div("Preview of predictions:", style={"color": MUTED, "marginTop": "8px"})
+            html.Div("Preview of demo model scores:", style={"color": MUTED, "marginTop": "8px"})
         )
         parts.append(
             dash_table.DataTable(
