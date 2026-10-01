@@ -10,7 +10,7 @@ from dash import dash_table
 import dash_bootstrap_components as dbc
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -62,15 +62,15 @@ logit = (
     + 0.45 * patients["Biomarker"]
 )
 prob = 1 / (1 + np.exp(-logit / 4))
-patients["Cancer Risk"] = (prob > np.quantile(prob, 0.62)).astype(int)
+patients["Demo Positive Label"] = (prob > np.quantile(prob, 0.62)).astype(int)
 patients["Risk Score"] = np.round(prob, 3)
 
 feature_cols = ["Age", "BMI", "Blood Pressure", "Glucose", "Smoker", "Family History", "Biomarker"]
 X = patients[feature_cols]
-y = patients["Cancer Risk"]
+y = patients["Demo Positive Label"]
 
 # -----------------------------
-# ML model for cancer risk
+# ML model for a synthetic classification target
 # -----------------------------
 model = Pipeline([
     ("imputer", SimpleImputer(strategy="median")),
@@ -81,6 +81,14 @@ model = Pipeline([
 Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=7, stratify=y)
 model.fit(Xtr, ytr)
 auc = roc_auc_score(yte, model.predict_proba(Xte)[:, 1])
+test_probabilities = model.predict_proba(Xte)[:, 1]
+test_predictions = (test_probabilities >= 0.5).astype(int)
+roc_fpr, roc_tpr, _ = roc_curve(yte, test_probabilities)
+test_confusion = confusion_matrix(yte, test_predictions, labels=[0, 1])
+true_negative, false_positive, false_negative, true_positive = test_confusion.ravel()
+sensitivity = true_positive / (true_positive + false_negative)
+specificity = true_negative / (true_negative + false_positive)
+patients["Risk Score"] = np.round(model.predict_proba(X)[:, 1], 3)
 
 # Precompute feature importances for explanations
 feature_importance = pd.Series(
@@ -215,7 +223,6 @@ app.layout = html.Div(
     children=[
         dcc.Store(id="chat-store", data=shared_store),
         dcc.Store(id="upload-store", data=None),  # persistent upload result
-        dcc.Interval(id="live-interval", interval=2500, n_intervals=0),
         dbc.Container(
             fluid=True,
             children=[
@@ -225,17 +232,17 @@ app.layout = html.Div(
                         html.H2(APP_TITLE, style={"margin": "0", "color": TEXT}),
                         html.Div(f"Created by {CREATOR}", style={"color": ACCENT, "marginTop": "4px"}),
                         html.Div(
-                            "Accessible AI-assisted clinical analytics, prevention support, collaboration, NLP reporting, and secure sharing.",
+                            "Interactive synthetic-data analytics demo with cohort exploration, model evaluation, and explainability.",
                             style={"color": MUTED},
                         ),
                     ],
                 ),
                 dbc.Row(
                     [
-                        dbc.Col(kpi_card("Patients", str(len(patients)), "Synthetic live demo data", ACCENT), md=3),
-                        dbc.Col(kpi_card("Cancer positives", str(int(patients["Cancer Risk"].sum())), f"Model AUC {auc:.2f}", ACCENT2), md=3),
-                        dbc.Col(kpi_card("High biomarker", str(int((patients["Biomarker"] > 3.0).sum())), "Flagged for review", WARN), md=3),
-                        dbc.Col(kpi_card("Status", "ONLINE", "Realtime updates enabled", ACCENT), md=3),
+                        dbc.Col(kpi_card("Patients", str(len(patients)), "Synthetic demo records", ACCENT), md=3),
+                        dbc.Col(kpi_card("Demo positive labels", str(int(patients["Demo Positive Label"].sum())), f"Holdout AUC {auc:.2f}", ACCENT2), md=3),
+                        dbc.Col(kpi_card("Biomarker > 3.0", str(int((patients["Biomarker"] > 3.0).sum())), "Synthetic threshold count", WARN), md=3),
+                        dbc.Col(kpi_card("Data mode", "DEMO", "Synthetic records only", ACCENT), md=3),
                     ],
                     className="g-3",
                     style={"marginBottom": "12px"},
@@ -245,7 +252,7 @@ app.layout = html.Div(
                         dbc.Col(
                             dcc.Dropdown(
                                 id="patient-dd",
-                                options=[{"label": p, "value": p} for p in patients["Patient ID"][:20]],
+                                options=[{"label": p, "value": p} for p in patients["Patient ID"]],
                                 value="P0001",
                                 clearable=False,
                             ),
@@ -268,7 +275,7 @@ app.layout = html.Div(
                     active_tab="tab-live",
                     children=[
                         dbc.Tab(label="Live Data", tab_id="tab-live"),
-                        dbc.Tab(label="Cancer Risk", tab_id="tab-cancer"),
+                        dbc.Tab(label="Risk Model Demo", tab_id="tab-cancer"),
                         dbc.Tab(label="Population Insights", tab_id="tab-pop"),
                         dbc.Tab(label="Patient Explorer", tab_id="tab-explorer"),
                         dbc.Tab(label="Clinical Report", tab_id="tab-nlp"),
@@ -276,6 +283,51 @@ app.layout = html.Div(
                         dbc.Tab(label="Collaboration", tab_id="tab-collab"),
                         dbc.Tab(label="Secure Sharing", tab_id="tab-chain"),
                     ],
+                ),
+                html.Div(
+                    [
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    [
+                                        dbc.Label("Age cohort", html_for="age-filter", style={"color": MUTED}),
+                                        dcc.Dropdown(
+                                            id="age-filter",
+                                            options=[
+                                                {"label": "All age groups", "value": "All"},
+                                                *[
+                                                    {"label": group, "value": group}
+                                                    for group in ["<35", "35-49", "50-64", "65+"]
+                                                ],
+                                            ],
+                                            value="All",
+                                            clearable=False,
+                                        ),
+                                    ],
+                                    md=6,
+                                ),
+                                dbc.Col(
+                                    [
+                                        dbc.Label("Smoking status", html_for="smoker-filter", style={"color": MUTED}),
+                                        dcc.Dropdown(
+                                            id="smoker-filter",
+                                            options=[
+                                                {"label": "All", "value": "all"},
+                                                {"label": "Smoker", "value": "1"},
+                                                {"label": "Non-smoker", "value": "0"},
+                                            ],
+                                            value="all",
+                                            clearable=False,
+                                        ),
+                                    ],
+                                    md=6,
+                                ),
+                            ],
+                            className="g-3",
+                        )
+                    ],
+                    id="population-filters",
+                    style={"display": "none", "padding": "12px 4px 0"},
                 ),
                 html.Div(id="tab-content", style={"padding": "14px 4px"}),
                 # This div will hold upload result independently of tabs
@@ -310,29 +362,39 @@ def add_message(n, msg, data):
     return data
 
 @callback(
+    Output("population-filters", "style"),
+    Input("tabs", "active_tab"),
+)
+def show_population_filters(tab):
+    return {"display": "block", "padding": "12px 4px 0"} if tab == "tab-pop" else {"display": "none"}
+
+@callback(
     Output("tab-content", "children"),
     Input("tabs", "active_tab"),
-    Input("live-interval", "n_intervals"),
     Input("patient-dd", "value"),
     Input("chat-store", "data"),
+    Input("age-filter", "value"),
+    Input("smoker-filter", "value"),
 )
-def render_tab(tab, n, patient_id, chat_data):
+def render_tab(tab, patient_id, chat_data, age_filter, smoker_filter):
     row, risk = patient_risk_row(patient_id)
 
     if tab == "tab-live":
-        fig = black_fig("Live Vital Trend")
-        xs = list(range(20))
-        ys = 72 + np.sin(np.linspace(0, 4 * np.pi, 20)) * 6 + np.random.normal(0, 1.2, 20)
+        fig = black_fig("Illustrative 24-hour heart-rate pattern")
+        xs = np.arange(24)
+        baseline = 68 + (row["Age"] >= 65) * 4 + row["Risk Score"] * 3
+        ys = baseline + np.sin(np.linspace(0, 4 * np.pi, 24)) * 5
         fig.add_trace(
             go.Scatter(
-                x=xs,
-                y=ys,
+                x=[f"{hour:02d}:00" for hour in xs],
+                y=np.round(ys, 1),
                 mode="lines+markers",
                 line=dict(color=ACCENT, width=3),
                 marker=dict(size=7),
-                name="Heart rate",
+                name="Illustrative heart rate",
             )
         )
+        fig.update_layout(xaxis_title="Hour", yaxis_title="Heart rate (bpm)")
 
         table = dash_table.DataTable(
             data=patients.head(8).to_dict("records"),
@@ -352,7 +414,14 @@ def render_tab(tab, n, patient_id, chat_data):
                 "border": f"1px solid {BORDER}",
             },
         )
-        return html.Div([dcc.Graph(figure=fig), table])
+        return html.Div([
+            dcc.Graph(figure=fig),
+            html.Div(
+                "Synthetic illustration only - this project contains no timestamped vital-sign records and is not a live patient-monitoring system.",
+                style={"color": MUTED, "marginBottom": "12px"},
+            ),
+            table,
+        ])
 
     if tab == "tab-cancer":
         fig = go.Figure(
@@ -395,37 +464,116 @@ def render_tab(tab, n, patient_id, chat_data):
             ),
             margin=dict(l=0, r=0, t=40, b=0),
         )
+        fig_roc = black_fig("Holdout ROC curve")
+        fig_roc.add_trace(
+            go.Scatter(
+                x=roc_fpr,
+                y=roc_tpr,
+                mode="lines",
+                line=dict(color=ACCENT, width=3),
+                name=f"AUC {auc:.2f}",
+            )
+        )
+        fig_roc.add_trace(
+            go.Scatter(
+                x=[0, 1],
+                y=[0, 1],
+                mode="lines",
+                line=dict(color=MUTED, dash="dash"),
+                name="Random baseline",
+            )
+        )
+        fig_roc.update_layout(xaxis_title="False positive rate", yaxis_title="True positive rate")
+
+        fig_matrix = black_fig("Holdout confusion matrix (threshold 0.50)")
+        fig_matrix.add_trace(
+            go.Heatmap(
+                z=test_confusion,
+                x=["Predicted low", "Predicted high"],
+                y=["Actual low", "Actual high"],
+                colorscale="Viridis",
+                text=test_confusion,
+                texttemplate="%{text}",
+                showscale=False,
+            )
+        )
         return html.Div([
             dcc.Graph(figure=fig),
-            html.Div(f"Predicted cancer risk for {patient_id}: {risk:.2%}", style={"color": ACCENT, "fontSize": "1.2rem"}),
-            html.Div("This result supports prevention workflows and should be interpreted by a clinician.", style={"color": MUTED}),
+            dbc.Row([
+                dbc.Col(dcc.Graph(figure=fig_roc), md=6),
+                dbc.Col(dcc.Graph(figure=fig_matrix), md=6),
+            ], className="g-3"),
+            dbc.Row([
+                dbc.Col(kpi_card("Holdout AUC", f"{auc:.2f}", "Threshold-independent ranking", ACCENT), md=4),
+                dbc.Col(kpi_card("Sensitivity", f"{sensitivity:.1%}", "At a 0.50 demo threshold", ACCENT2), md=4),
+                dbc.Col(kpi_card("Specificity", f"{specificity:.1%}", "At a 0.50 demo threshold", WARN), md=4),
+            ], className="g-3 mb-3"),
+            html.Div(f"Model score for {patient_id}: {risk:.1%}", style={"color": ACCENT, "fontSize": "1.2rem"}),
+            html.Div(
+                "Educational synthetic demo: the target is generated from simulated features, so these scores and holdout metrics are not clinical evidence or validated cancer predictions.",
+                style={"color": MUTED},
+            ),
         ])
 
     if tab == "tab-pop":
-        agg = patients.groupby("Age Group", as_index=False).agg(
-            {"Risk Score": "mean", "Cancer Risk": "sum", "Patient ID": "count"}
-        ).rename(columns={"Patient ID": "Count"})
-        fig_age = black_fig("Average Risk Score by Age Group")
+        cohort = patients.copy()
+        if age_filter and age_filter != "All":
+            cohort = cohort[cohort["Age Group"] == age_filter]
+        if smoker_filter in {"0", "1"}:
+            cohort = cohort[cohort["Smoker"] == int(smoker_filter)]
+        if cohort.empty:
+            return html.Div("No patients match the selected cohort.", style={"color": MUTED})
+
+        age_order = ["<35", "35-49", "50-64", "65+"]
+        agg = cohort.groupby("Age Group", as_index=False, observed=False).agg(
+            mean_score=("Risk Score", "mean"),
+            positive_rate=("Demo Positive Label", "mean"),
+            patients=("Patient ID", "count"),
+        )
+        agg["Age Group"] = pd.Categorical(agg["Age Group"], categories=age_order, ordered=True)
+        agg = agg.sort_values("Age Group")
+        agg["positive_rate"] *= 100
+
+        fig_age = black_fig("Mean model score by age group")
         fig_age.add_trace(
             go.Bar(
                 x=agg["Age Group"],
-                y=agg["Risk Score"],
+                y=agg["mean_score"],
                 marker_color=ACCENT,
-                name="Avg Risk Score",
+                name="Mean model score",
+                customdata=agg[["patients", "positive_rate"]],
+                hovertemplate="Age %{x}<br>Mean score %{y:.1%}<br>Patients %{customdata[0]}<br>Demo positive rate %{customdata[1]:.1f}%<extra></extra>",
             )
         )
-        smoke_agg = patients.groupby("Smoker", as_index=False)["Risk Score"].mean()
+        fig_age.update_layout(yaxis_title="Mean model score")
+
+        smoke_agg = cohort.groupby("Smoker", as_index=False).agg(
+            mean_score=("Risk Score", "mean"),
+            positive_rate=("Demo Positive Label", "mean"),
+            patients=("Patient ID", "count"),
+        )
         smoke_agg["Label"] = smoke_agg["Smoker"].map({0: "Non-smoker", 1: "Smoker"})
-        fig_smoke = black_fig("Risk by Smoking Status")
+        smoke_agg["positive_rate"] *= 100
+        fig_smoke = black_fig("Model score by smoking status")
         fig_smoke.add_trace(
             go.Bar(
                 x=smoke_agg["Label"],
-                y=smoke_agg["Risk Score"],
-                marker_color=[ACCENT2, WARN],
-                name="Avg Risk",
+                y=smoke_agg["mean_score"],
+                marker_color=smoke_agg["Smoker"].map({0: ACCENT2, 1: WARN}),
+                name="Mean model score",
+                customdata=smoke_agg[["patients", "positive_rate"]],
+                hovertemplate="%{x}<br>Mean score %{y:.1%}<br>Patients %{customdata[0]}<br>Demo positive rate %{customdata[1]:.1f}%<extra></extra>",
             )
         )
-        heat = patients.groupby(["Age Group", "Smoker"])["Risk Score"].mean().unstack(fill_value=0)
+        fig_smoke.update_layout(yaxis_title="Mean model score")
+
+        heat = cohort.pivot_table(
+            index="Age Group",
+            columns="Smoker",
+            values="Risk Score",
+            aggfunc="mean",
+            observed=False,
+        ).reindex(index=age_order, columns=[0, 1])
         heat.index = heat.index.astype(str)
         heat.columns = heat.columns.map({0: "Non-smoker", 1: "Smoker"})
         fig_heat = black_fig("Risk Heatmap: Age Group × Smoking")
@@ -436,9 +584,44 @@ def render_tab(tab, n, patient_id, chat_data):
                 y=heat.index.tolist(),
                 colorscale="Viridis",
                 showscale=True,
+                colorbar={"title": "Mean score"},
             )
         )
+        fig_scatter = black_fig("BMI and glucose by patient")
+        fig_scatter.add_trace(
+            go.Scatter(
+                x=cohort["BMI"],
+                y=cohort["Glucose"],
+                mode="markers",
+                marker={
+                    "size": 8,
+                    "color": cohort["Risk Score"],
+                    "colorscale": "Viridis",
+                    "showscale": True,
+                    "colorbar": {"title": "Model score"},
+                    "line": {"width": 0.5, "color": TEXT},
+                },
+                text=cohort["Patient ID"],
+                customdata=np.column_stack([cohort["Age"], cohort["Risk Score"]]),
+                hovertemplate="%{text}<br>BMI %{x}<br>Glucose %{y}<br>Age %{customdata[0]}<br>Model score %{customdata[1]:.1%}<extra></extra>",
+                name="Patients",
+            )
+        )
+        fig_scatter.update_layout(xaxis_title="BMI", yaxis_title="Glucose")
+
+        top_group = agg.loc[agg["mean_score"].idxmax()]
+        insight = (
+            f"{len(cohort)} synthetic patients in this cohort. "
+            f"The highest mean model score is in age group {top_group['Age Group']} "
+            f"({top_group['mean_score']:.1%}; n={int(top_group['patients'])}). "
+            "These are descriptive patterns in generated demo data, not population-health estimates."
+        )
         return html.Div([
+            dbc.Row([
+                dbc.Col(kpi_card("Patients in cohort", f"{len(cohort):,}", "After selected filters", ACCENT), md=4),
+                dbc.Col(kpi_card("Mean model score", f"{cohort['Risk Score'].mean():.1%}", "Not a clinical probability", ACCENT2), md=4),
+                dbc.Col(kpi_card("Demo positive labels", f"{cohort['Demo Positive Label'].mean():.1%}", "Simulated target labels", WARN), md=4),
+            ], className="g-3 mb-2"),
             dbc.Row([
                 dbc.Col(dcc.Graph(figure=fig_age), md=6),
                 dbc.Col(dcc.Graph(figure=fig_smoke), md=6),
@@ -446,7 +629,10 @@ def render_tab(tab, n, patient_id, chat_data):
             dbc.Row([
                 dbc.Col(dcc.Graph(figure=fig_heat), md=12),
             ], className="g-3 mt-2"),
-            html.Div("Population-level insights help prioritize prevention programs.", style={"color": MUTED, "marginTop": "8px"}),
+            dbc.Row([
+                dbc.Col(dcc.Graph(figure=fig_scatter), md=12),
+            ], className="g-3 mt-2"),
+            html.Div(insight, style={"color": MUTED, "marginTop": "8px"}),
         ])
 
     if tab == "tab-explorer":
@@ -480,9 +666,9 @@ def render_tab(tab, n, patient_id, chat_data):
 
         top_factors = feature_importance.head(3).index.tolist()
         explanation = (
-            f"For {patient_id}, the model's prediction is driven mainly by: "
-            + ", ".join(top_factors)
-            + ". Higher values in these factors generally increase risk."
+            f"The demo model's highest global feature importances are: {', '.join(top_factors)}. "
+            f"{patient_id}'s model score is {risk:.1%}. Global feature importance does not explain "
+            "the cause of an individual patient's score."
         )
         return html.Div([
             dbc.Row([
@@ -494,21 +680,23 @@ def render_tab(tab, n, patient_id, chat_data):
         ])
 
     if tab == "tab-nlp":
-        idx = n % len(notes_df)
-        note = notes_df.iloc[idx]["note"]
-        summary = notes_df.iloc[idx]["summary"]
-        generated = simple_clinical_interpretation(note)
         return html.Div([
-            dbc.Textarea(
-                value=note,
-                style={"backgroundColor": PANEL, "color": TEXT, "height": "140px"},
-                readOnly=True,
-            ),
-            html.Hr(style={"borderColor": BORDER}),
-            html.Div("AI-assisted summary:", style={"color": ACCENT2, "fontWeight": "700"}),
-            html.Div(summary, style={"color": TEXT, "marginBottom": "8px"}),
-            html.Div("Plain-language clinical note interpretation:", style={"color": ACCENT, "fontWeight": "700"}),
-            html.Div(generated, style={"color": TEXT}),
+            html.Div(
+                [
+                    html.H5(f"Example note {index + 1}", style={"color": ACCENT}),
+                    dbc.Textarea(
+                        value=note,
+                        style={"backgroundColor": PANEL, "color": TEXT, "height": "90px"},
+                        readOnly=True,
+                    ),
+                    html.Div("Demo summary:", style={"color": ACCENT2, "fontWeight": "700", "marginTop": "8px"}),
+                    html.Div(summary, style={"color": TEXT, "marginBottom": "8px"}),
+                    html.Div("Rule-based interpretation:", style={"color": ACCENT, "fontWeight": "700"}),
+                    html.Div(simple_clinical_interpretation(note), style={"color": TEXT}),
+                ],
+                style={"backgroundColor": PANEL, "padding": "14px", "border": f"1px solid {BORDER}", "borderRadius": "12px", "marginBottom": "12px"},
+            )
+            for index, (note, summary) in enumerate(zip(notes_df["note"], notes_df["summary"]))
         ])
 
     if tab == "tab-upload":
@@ -542,7 +730,7 @@ def render_tab(tab, n, patient_id, chat_data):
                 style={"backgroundColor": PANEL, "padding": "16px", "border": f"1px solid {BORDER}", "borderRadius": "12px"},
             ),
             html.Div(
-                "You can upload any CSV file. If it contains healthcare-like columns (Age, BMI, Blood Pressure, Glucose, Smoker, Family History, Biomarker), the dashboard will also show risk predictions.",
+                "You can upload a CSV for preview. Matching synthetic-demo feature columns enable illustrative model scores, not clinical predictions.",
                 style={"color": MUTED, "marginTop": "8px"},
             ),
         ])
@@ -569,7 +757,10 @@ def render_tab(tab, n, patient_id, chat_data):
                     "minHeight": "120px",
                 },
             ),
-            html.Div("Shared room updates appear for all connected users.", style={"marginTop": "8px", "color": MUTED}),
+            html.Div(
+                "Demo messages stay in this browser session; users are not connected and messages are not shared across browsers.",
+                style={"marginTop": "8px", "color": MUTED},
+            ),
         ])
 
     fig = black_fig("Secure Sharing Ledger")
@@ -696,8 +887,8 @@ def handle_upload(contents, filename):
             if len(df_clean) > 0:
                 Xnew = df_clean[required]
                 risk_new = model.predict_proba(Xnew)[:, 1]
-                df_clean["Predicted Risk"] = np.round(risk_new, 3)
-                high = int((df_clean["Predicted Risk"] > 0.6).sum())
+                df_clean["Demo Model Score"] = np.round(risk_new, 3)
+                high = int((df_clean["Demo Model Score"] > 0.6).sum())
                 total = len(df_clean)
 
                 result["risk_head"] = df_clean.head(10).to_dict("records")
@@ -746,18 +937,18 @@ def render_upload_result(stored):
 
         parts.append(
             html.Div(
-                "This file looks like healthcare data. Showing risk predictions for matching rows:",
+                "Feature columns match the synthetic demo model. Showing illustrative scores for matching rows:",
                 style={"color": ACCENT2, "fontWeight": "700", "marginTop": "12px"},
             )
         )
         parts.append(
             html.Div(
-                f"Valid rows used for prediction: {total}. High-risk (>60%): {high}",
+                f"Valid rows scored: {total}. Demo scores above 60%: {high}",
                 style={"color": ACCENT, "fontSize": "1.05rem"},
             )
         )
         parts.append(
-            html.Div("Preview of predictions:", style={"color": MUTED, "marginTop": "8px"})
+            html.Div("Preview of demo model scores:", style={"color": MUTED, "marginTop": "8px"})
         )
         parts.append(
             dash_table.DataTable(
