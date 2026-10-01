@@ -1,6 +1,8 @@
-🏥 Healthcare Analytics Dashboard
+<div align="center">
 
-Explore synthetic health data with interactive charts and machine-learning demos
+# 🏥 Healthcare Analytics Dashboard
+
+### Explore synthetic health data with interactive charts and machine-learning demos
 
 <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white">
 <img alt="Dash" src="https://img.shields.io/badge/Dash-Interactive%20App-008DE4?style=for-the-badge&logo=plotly&logoColor=white">
@@ -9,16 +11,16 @@ Explore synthetic health data with interactive charts and machine-learning demos
 
 <br>
 
-Model Studio · Live-feed simulator · 3D patient explorer · Cohort analytics
+**Model Studio** · **Live-feed simulator** · **3D patient explorer** · **Cohort analytics**
 
 </div>
 
+---
 
+> [!WARNING]
+> **Synthetic-data project - not for clinical use.** Patient records, labels, and streaming readings are generated. This app is not connected to a medical device, EHR, or real patient, and its model outputs and threshold flags are not validated for care decisions.
 
-[!WARNING]
-Synthetic-data project - not for clinical use. Patient records, labels, and streaming readings are generated. This app is not connected to a medical device, EHR, or real patient, and its model outputs and threshold flags are not validated for care decisions.
-
-✨ Explore the dashboard
+## ✨ Explore the dashboard
 
 <table>
   <tr>
@@ -53,7 +55,7 @@ Synthetic-data project - not for clinical use. Patient records, labels, and stre
   </tr>
 </table>
 
-🧰 Built with
+## 🧰 Built with
 
 <table>
   <tr>
@@ -94,53 +96,59 @@ Synthetic-data project - not for clinical use. Patient records, labels, and stre
   </tr>
 </table>
 
-Machine-learning methods
+### Machine-learning methods
 
-Logistic Regression · Random Forest · Histogram Gradient Boosting · K-means · PCA · TF-IDF + Naive Bayes
+`Logistic Regression` · `Random Forest` · `Histogram Gradient Boosting` · `K-means` · `PCA` · `TF-IDF + Naive Bayes`
 
-🚀 Run locally
+## 🚀 Run locally
 
-Requirements: Python 3.10 or newer.
+**Requirements:** Python 3.10 or newer.
 
+```bash
 git clone https://github.com/aniruddhadhibar5-bot/-Healthcare-Analytics-Dashboard.git healthcare-analytics-dashboard
 cd healthcare-analytics-dashboard
 python -m venv .venv
+```
 
 Activate the environment and launch:
 
+```powershell
 # Windows PowerShell
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python app.py
+```
 
+```bash
 # macOS / Linux
 source .venv/bin/activate
 pip install -r requirements.txt
 python app.py
+```
 
-Open the local URL printed by Dash (typically http://127.0.0.1:8050). The WSGI application entry point is app:server.
+Open the local URL printed by Dash (typically `http://127.0.0.1:8050`). The WSGI application entry point is `app:server`.
 
-🧭 Dashboard guide
+## 🧭 Dashboard guide
 
-Tab
-What you can explore
-Live Data
-Timestamped simulated vital readings, rolling charts, demo threshold flags, and CSV export
-Model Studio
-Candidate model benchmark, threshold exploration, ROC/PR, calibration, and metrics
-Patient Phenotypes
-Interactive 3D features, PCA projection, and unsupervised profile summaries
-Population Insights
-Age/smoking filters, cohort comparisons, and population charts
-Patient Explorer
-Selected synthetic profile and model feature summaries
-Data Upload
-CSV preview and illustrative scoring for matching demo columns
+| Tab | What you can explore |
+| --- | --- |
+| **Live Data** | Timestamped simulated vital readings, rolling charts, demo threshold flags, and CSV export |
+| **Model Studio** | Candidate model benchmark, threshold exploration, ROC/PR, calibration, and metrics |
+| **Patient Phenotypes** | Interactive 3D features, PCA projection, and unsupervised profile summaries |
+| **Population Insights** | Age/smoking filters, cohort comparisons, and population charts |
+| **Patient Explorer** | Selected synthetic profile and model feature summaries |
+| **Data Upload** | CSV preview and illustrative scoring for matching demo columns |
 
-⚠️ Data, safety, and limitations
+## ⚠️ Data, safety, and limitations
 
-Patient records, model labels, and streaming vitals are generated; they do not represent real people or live monitoring.
-The classifiers learn a synthetic target, not a clinically diagnosed outcome. Metrics, calibration, clusters, feature importance, and threshold flags are educational examples, not clinical evidence or medical advice.
-The note interpretation uses simple keyword rules. It is not a medical language model or a clinical decision-support system.
-The app is not suitable for clinical use or patient-care decisions. Do not upload identifiable health information.
-Connecting a real EHR or medical device requires an approved data source, documented integration, access controls, privacy/security review, and clinical and regulatory validation.
+- Patient records, model labels, and streaming vitals are generated; they do not represent real people or live monitoring.
+- The classifiers learn a **synthetic target**, not a clinically diagnosed outcome. Metrics, calibration, clusters, feature importance, and threshold flags are educational examples, not clinical evidence or medical advice.
+- The note interpretation uses simple keyword rules. It is not a medical language model or a clinical decision-support system.
+- The app is **not suitable for clinical use or patient-care decisions**. Do not upload identifiable health information.
+- Connecting a real EHR or medical device requires an approved data source, documented integration, access controls, privacy/security review, and clinical and regulatory validation.
+
+---
+
+<div align="center">
+  Made for interactive exploration · Built with Python and Plotly
+</div>

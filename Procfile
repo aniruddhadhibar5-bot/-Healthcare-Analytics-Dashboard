@@ -1,2 +1,1 @@
-web: gunicorn 
-healthcare_dashboard:app
+web: gunicorn app:server
