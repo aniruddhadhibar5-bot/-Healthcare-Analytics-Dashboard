@@ -1,5 +1,10 @@
 import base64
 import io
+import json
+import queue
+import threading
+import time
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import numpy as np
@@ -68,6 +73,10 @@ patients = pd.DataFrame({
     "Family History": np.random.choice([0, 1], N, p=[0.7, 0.3]),
     "Biomarker": np.round(np.random.normal(2.4, 0.8, N).clip(0.2, 8), 2),
 })
+
+live_stream_queue = queue.Queue(maxsize=1000)
+stream_lock = threading.Lock()
+patient_streams = defaultdict(list)
 
 logit = (
     0.03 * (patients["Age"] - 50)
@@ -209,10 +218,23 @@ def black_fig(title: str):
         title=dict(text=title, x=0.02),
         margin=dict(l=40, r=20, t=55, b=40),
         legend=dict(bgcolor=BLACK),
+        transition={"duration": 500, "easing": "cubic-in-out"},
     )
     fig.update_xaxes(gridcolor="#222", zerolinecolor="#222", color=TEXT)
     fig.update_yaxes(gridcolor="#222", zerolinecolor="#222", color=TEXT)
     return fig
+
+def animated_graph(figure, **kwargs):
+    kwargs.setdefault("animate", True)
+    kwargs.setdefault(
+        "animation_options",
+        {
+            "frame": {"duration": 500, "redraw": False},
+            "transition": {"duration": 450, "easing": "cubic-in-out"},
+        },
+    )
+    kwargs.setdefault("config", {"displaylogo": False, "scrollZoom": True})
+    return dcc.Graph(figure=figure, **kwargs)
 
 def kpi_card(title, value, sub, color):
     return dbc.Card(
@@ -286,14 +308,44 @@ def live_demo_flags(reading):
     ]
     return [label for label, flagged in checks if flagged]
 
-def append_live_reading(tick, patient_id, readings, patient_changed=False):
-    readings = readings or []
-    if patient_changed or (
-        readings and readings[-1].get("Patient ID") != patient_id
-    ):
-        readings = []
-    readings.append(generate_live_reading(patient_id, tick or 0))
-    return readings[-60:]
+def telemetry_stream_worker():
+    tick = 0
+    patient_ids = patients["Patient ID"].tolist()
+    while True:
+        for patient_id in patient_ids:
+            message = json.dumps(generate_live_reading(patient_id, tick))
+            try:
+                live_stream_queue.put_nowait(message)
+            except queue.Full:
+                try:
+                    live_stream_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                live_stream_queue.put_nowait(message)
+        tick += 1
+        time.sleep(3)
+
+def drain_live_stream():
+    while True:
+        try:
+            reading = json.loads(live_stream_queue.get_nowait())
+        except queue.Empty:
+            break
+        with stream_lock:
+            stream = patient_streams[reading["Patient ID"]]
+            stream.append(reading)
+            del stream[:-60]
+
+def get_live_readings(patient_id):
+    drain_live_stream()
+    with stream_lock:
+        return list(patient_streams.get(patient_id, []))
+
+threading.Thread(
+    target=telemetry_stream_worker,
+    name="synthetic-telemetry-publisher",
+    daemon=True,
+).start()
 
 def live_monitoring_layout(readings):
     current = readings[-1] if readings else None
@@ -722,15 +774,15 @@ def render_tab(tab, patient_id, chat_data, age_filter, smoker_filter, selected_m
             html.Div("All candidates share the same stratified holdout. Metrics describe this simulated task only.", style={"color": MUTED}),
             leaderboard,
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_roc), md=6),
-                dbc.Col(dcc.Graph(figure=fig_pr), md=6),
+                dbc.Col(animated_graph(fig_roc), md=6),
+                dbc.Col(animated_graph(fig_pr), md=6),
             ], className="g-3 mt-2"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_matrix), md=6),
-                dbc.Col(dcc.Graph(figure=fig_calibration), md=6),
+                dbc.Col(animated_graph(fig_matrix), md=6),
+                dbc.Col(animated_graph(fig_calibration), md=6),
             ], className="g-3"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_importance), md=12),
+                dbc.Col(animated_graph(fig_importance), md=12),
             ], className="g-3"),
             html.Div(
                 "Threshold changes are an interactive operating-point demonstration, not clinical guidance. Calibration and feature signals are not validated on real-world data.",
@@ -835,11 +887,11 @@ def render_tab(tab, patient_id, chat_data, age_filter, smoker_filter, selected_m
                 dbc.Col(kpi_card("Patients grouped", f"{len(patients):,}", "Synthetic dataset", WARN), md=4),
             ], className="g-3 mb-2"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_3d, config={"displaylogo": False}), md=7),
-                dbc.Col(dcc.Graph(figure=fig_pca, config={"displaylogo": False}), md=5),
+                dbc.Col(animated_graph(fig_3d), md=7),
+                dbc.Col(animated_graph(fig_pca), md=5),
             ], className="g-3"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_profile), md=12),
+                dbc.Col(animated_graph(fig_profile), md=12),
             ], className="g-3"),
             html.H5("Profile summary", style={"color": TEXT, "marginTop": "16px"}),
             dash_table.DataTable(
@@ -933,10 +985,10 @@ def render_tab(tab, patient_id, chat_data, age_filter, smoker_filter, selected_m
             )
         )
         return html.Div([
-            dcc.Graph(figure=fig),
+            animated_graph(fig),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_roc), md=6),
-                dbc.Col(dcc.Graph(figure=fig_matrix), md=6),
+                dbc.Col(animated_graph(fig_roc), md=6),
+                dbc.Col(animated_graph(fig_matrix), md=6),
             ], className="g-3"),
             dbc.Row([
                 dbc.Col(kpi_card("Holdout AUC", f"{auc:.2f}", "Threshold-independent ranking", ACCENT), md=4),
@@ -1058,14 +1110,14 @@ def render_tab(tab, patient_id, chat_data, age_filter, smoker_filter, selected_m
                 dbc.Col(kpi_card("Demo positive labels", f"{cohort['Demo Positive Label'].mean():.1%}", "Simulated target labels", WARN), md=4),
             ], className="g-3 mb-2"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_age), md=6),
-                dbc.Col(dcc.Graph(figure=fig_smoke), md=6),
+                dbc.Col(animated_graph(fig_age), md=6),
+                dbc.Col(animated_graph(fig_smoke), md=6),
             ], className="g-3"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_heat), md=12),
+                dbc.Col(animated_graph(fig_heat), md=12),
             ], className="g-3 mt-2"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_scatter), md=12),
+                dbc.Col(animated_graph(fig_scatter), md=12),
             ], className="g-3 mt-2"),
             html.Div(insight, style={"color": MUTED, "marginTop": "8px"}),
         ])
@@ -1107,8 +1159,8 @@ def render_tab(tab, patient_id, chat_data, age_filter, smoker_filter, selected_m
         )
         return html.Div([
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_imp), md=6),
-                dbc.Col(dcc.Graph(figure=fig_radar), md=6),
+                dbc.Col(animated_graph(fig_imp), md=6),
+                dbc.Col(animated_graph(fig_radar), md=6),
             ], className="g-3"),
             html.Div(explanation, style={"color": TEXT, "marginTop": "12px", "fontSize": "1.05rem"}),
             html.Div("Use this to discuss personalized prevention strategies with a clinician.", style={"color": MUTED}),
@@ -1204,7 +1256,7 @@ def render_tab(tab, patient_id, chat_data, age_filter, smoker_filter, selected_m
     y = list(range(1, len(x) + 1)) if ledger else [1]
     fig.add_trace(go.Bar(x=x, y=y, marker_color=ACCENT))
     return html.Div([
-        dcc.Graph(figure=fig),
+        animated_graph(fig),
         html.Div("Blockchain-style audit trail demo for secure healthcare sharing.", style={"color": MUTED}),
         html.Div("Only hashes and events should be shared on-chain in a real deployment.", style={"color": ACCENT2}),
     ])
@@ -1216,12 +1268,13 @@ def render_tab(tab, patient_id, chat_data, age_filter, smoker_filter, selected_m
     State("live-feed-store", "data"),
 )
 def update_live_feed(tick, patient_id, readings):
-    return append_live_reading(
-        tick,
-        patient_id,
-        readings,
-        patient_changed=ctx.triggered_id == "patient-dd",
-    )
+    if (
+        ctx.triggered_id == "patient-dd"
+        or (readings and readings[-1].get("Patient ID") != patient_id)
+    ):
+        readings = []
+    latest = get_live_readings(patient_id)
+    return latest[-60:] if latest else (readings or [])
 
 def make_live_chart(readings, title, value_key, color, unit):
     fig = black_fig(title)
